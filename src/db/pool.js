@@ -1,4 +1,9 @@
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// BIGSERIAL ids arrive as strings by default, which makes every client compare
+// ids as text (`1` !== `"1"`). Our ids stay far below 2^53, so hand them to
+// consumers — web today, Flutter later — as real numbers.
+types.setTypeParser(20, function (v) { return v === null ? null : parseInt(v, 10); });
 
 // Render's managed Postgres requires SSL; local dev usually doesn't.
 const useSSL = /render\.com|amazonaws\.com/.test(process.env.DATABASE_URL || '');
