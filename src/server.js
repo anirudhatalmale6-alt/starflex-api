@@ -33,6 +33,8 @@ app.post('/api/admin/migrate', async (req, res) => {
     const path = require('path');
     const { pool, query } = require('./db/pool');
     await pool.query(fs.readFileSync(path.join(__dirname, 'db/schema.sql'), 'utf8'));
+    /* the CMS tables, applied after the base schema because they ALTER posts */
+    await pool.query(fs.readFileSync(path.join(__dirname, 'db/cms.sql'), 'utf8'));
 
     const seeded = {};
     const m = await query('SELECT COUNT(*)::int AS n FROM modules');
@@ -67,6 +69,9 @@ app.post('/api/admin/migrate', async (req, res) => {
 
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/civic', require('./routes/civic'));
+/* The StarFlex content manager. ⛔ Its own accounts, its own tokens — see the
+   header of routes/cms.js for why a citizen can never open it. */
+app.use('/api/cms', require('./routes/cms'));
 
 app.use((req, res) => res.status(404).json({ success: false, message: 'Route introuvable' }));
 
