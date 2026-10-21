@@ -5,6 +5,7 @@ const { body, validationResult } = require('express-validator');
 const { query } = require('../db/pool');
 const { sign, protect } = require('../middleware/auth');
 const { awardPoints } = require('../services/points');
+const throttle = require('../middleware/throttle');
 
 const router = express.Router();
 
@@ -244,16 +245,22 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Identifiant et mot de passe requis' });
     }
 
+    if (!throttle.allow(req, res, 'citizen', identifier)) return;
     const { rows } = await query(
       'SELECT * FROM citizens WHERE email = $1 OR phone = $1',
       [identifier.toLowerCase()]
     );
     if (!rows.length) {
+      throttle.fail(req, 'citizen', identifier);
       return res.status(400).json({ success: false, message: 'Identifiants incorrects' });
     }
     const citizen = rows[0];
     const ok = await bcrypt.compare(password, citizen.password_hash);
-    if (!ok) return res.status(400).json({ success: false, message: 'Identifiants incorrects' });
+    if (!ok) {
+      throttle.fail(req, 'citizen', identifier);
+      return res.status(400).json({ success: false, message: 'Identifiants incorrects' });
+    }
+    throttle.succeed('citizen', identifier);
     if (citizen.status !== 'active') {
       return res.status(403).json({ success: false, message: 'Compte suspendu' });
     }

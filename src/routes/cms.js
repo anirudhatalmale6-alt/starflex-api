@@ -15,6 +15,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query } = require('../db/pool');
+const throttle = require('../middleware/throttle');
 
 const router = express.Router();
 const SECRET = process.env.JWT_SECRET || 'starflex-dev-secret';
@@ -93,14 +94,16 @@ router.post('/login', async (req, res) => {
     if (!email || !password) {
       return res.status(400).json({ success: false, message: 'Email et mot de passe requis' });
     }
+    if (!throttle.allow(req, res, 'cms', email)) return;
     const { rows } = await query(
       "SELECT * FROM cms_users WHERE email = LOWER($1) AND status = 'active'", [String(email).trim()]);
     /* ⛔ One message for "no such email" and "wrong password" alike - telling
        an attacker which addresses exist is a gift. */
     const bad = { success: false, message: 'Email ou mot de passe incorrect' };
-    if (!rows.length) { await bcrypt.compare('x', '$2a$10$' + 'x'.repeat(53)).catch(() => {}); return res.status(401).json(bad); }
+    if (!rows.length) { await bcrypt.compare('x', '$2a$10$' + 'x'.repeat(53)).catch(() => {}); throttle.fail(req, 'cms', email); return res.status(401).json(bad); }
     const u = rows[0];
-    if (!(await bcrypt.compare(String(password), u.pass_hash))) return res.status(401).json(bad);
+    if (!(await bcrypt.compare(String(password), u.pass_hash))) { throttle.fail(req, 'cms', email); return res.status(401).json(bad); }
+    throttle.succeed('cms', email);
     await query('UPDATE cms_users SET last_login = NOW() WHERE id = $1', [u.id]);
     res.json({ success: true, token: sign(u),
                user: { id: u.id, email: u.email, name: u.name, role: u.role } });

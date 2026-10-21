@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 
 const app = express();
+app.set('trust proxy', 1);   // Render sits in front; req.ip = the real visitor
 app.use(helmet());
 app.use(cors());                       // public platform; tighten to domains at launch
 app.use(express.json({ limit: '1mb' }));
