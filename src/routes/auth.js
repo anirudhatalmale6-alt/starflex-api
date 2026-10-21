@@ -1,5 +1,6 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
 const { query } = require('../db/pool');
 const { sign, protect } = require('../middleware/auth');
@@ -13,18 +14,44 @@ const OTP_TTL_MIN = 10;
 const EXPOSE_OTP = process.env.EXPOSE_OTP === 'true' || process.env.NODE_ENV !== 'production';
 
 function makeOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(crypto.randomInt(100000, 1000000));
 }
 
-async function issueOtp(citizenId, channel, purpose = 'verify') {
+const MAX_ATTEMPTS = 5;            // wrong codes before the code is burnt
+const RESEND_COOLDOWN_SEC = 60;    // one new code per minute
+const MAX_CODES_PER_HOUR = 5;      // per account
+
+function hashTicket(ticket) {
+  return crypto.createHash('sha256').update(String(ticket)).digest('hex');
+}
+
+/* 🔒 Every code is bound to a TICKET: a random secret given only to the
+   person who just registered, or who just logged in with the right password.
+   verify-otp and resend-otp need that ticket. The citizen id alone (1, 2, 3…)
+   is no longer enough, which is what let anyone take over any account.
+   Issuing a new code cancels the older ones. */
+async function issueOtp(citizenId, channel, purpose = 'verify', ticketHash = null) {
   const code = makeOtp();
+  let ticket = null;
+  if (!ticketHash) {
+    ticket = crypto.randomBytes(24).toString('base64url');
+    ticketHash = hashTicket(ticket);
+  }
   await query(
-    `INSERT INTO otp_codes (citizen_id, code, channel, purpose, expires_at)
-     VALUES ($1,$2,$3,$4, NOW() + ($5 || ' minutes')::interval)`,
-    [citizenId, code, channel, purpose, String(OTP_TTL_MIN)]
+    'UPDATE otp_codes SET consumed_at = NOW() WHERE citizen_id = $1 AND consumed_at IS NULL',
+    [citizenId]
+  );
+  await query(
+    `INSERT INTO otp_codes (citizen_id, code, channel, purpose, expires_at, ticket_hash)
+     VALUES ($1,$2,$3,$4, NOW() + ($5 || ' minutes')::interval, $6)`,
+    [citizenId, code, channel, purpose, String(OTP_TTL_MIN), ticketHash]
   );
   // TODO: wire SendGrid/Twilio here — the rest of the flow already works.
-  return code;
+  return { code, ticket };
+}
+
+function isVerified(c) {
+  return !!(c.email_verified || c.phone_verified);
 }
 
 // POST /api/auth/register — create a citizen account and send a verification code
@@ -62,7 +89,7 @@ router.post('/register',
       const citizen = rows[0];
 
       const channel = email ? 'email' : 'sms';
-      const code = await issueOtp(citizen.id, channel);
+      const { code, ticket } = await issueOtp(citizen.id, channel);
 
       await query(
         `INSERT INTO notifications (citizen_id, title, body)
@@ -74,7 +101,7 @@ router.post('/register',
       res.status(201).json({
         success: true,
         message: `Code de vérification envoyé par ${channel === 'email' ? 'email' : 'SMS'}`,
-        data: { citizen_id: citizen.id, channel, otp: EXPOSE_OTP ? code : undefined }
+        data: { citizen_id: citizen.id, channel, ticket, otp: EXPOSE_OTP ? code : undefined }
       });
     } catch (e) {
       console.error('register error', e.message);
@@ -84,40 +111,79 @@ router.post('/register',
 );
 
 // POST /api/auth/verify-otp — confirm the code, activate the account, return a token
+// 🔒 Needs the ticket from register/login. Only for accounts NOT yet verified:
+// a verified account signs in with its password, never with a code.
 router.post('/verify-otp', async (req, res) => {
   try {
-    const { citizen_id, code } = req.body;
-    if (!citizen_id || !code) {
-      return res.status(400).json({ success: false, message: 'Code requis' });
+    const { ticket, code } = req.body;
+    if (!ticket || !code) {
+      return res.status(400).json({ success: false, code: 'ticket_required', message: 'Session de vérification expirée — reconnectez-vous pour recevoir un nouveau code' });
     }
     const { rows } = await query(
-      `SELECT * FROM otp_codes
-       WHERE citizen_id = $1 AND code = $2 AND consumed_at IS NULL AND expires_at > NOW()
-       ORDER BY id DESC LIMIT 1`,
-      [citizen_id, String(code).trim()]
+      `SELECT o.*, c.email_verified, c.phone_verified, c.status
+         FROM otp_codes o JOIN citizens c ON c.id = o.citizen_id
+        WHERE o.ticket_hash = $1 AND o.consumed_at IS NULL AND o.expires_at > NOW()
+        ORDER BY o.id DESC LIMIT 1`,
+      [hashTicket(ticket)]
     );
     if (!rows.length) {
       return res.status(400).json({ success: false, message: 'Code invalide ou expiré' });
     }
-
     const otp = rows[0];
-    await query('UPDATE otp_codes SET consumed_at = NOW() WHERE id = $1', [otp.id]);
+
+    if (isVerified(otp) || otp.status !== 'active') {
+      await query('UPDATE otp_codes SET consumed_at = NOW() WHERE id = $1', [otp.id]);
+      return res.status(400).json({ success: false, code: 'already_verified', message: 'Ce compte est déjà vérifié — connectez-vous avec votre mot de passe' });
+    }
+
+    const given = String(code).trim();
+    const match = given.length === otp.code.length &&
+      crypto.timingSafeEqual(Buffer.from(given), Buffer.from(otp.code));
+    if (!match) {
+      const n = otp.attempts + 1;
+      if (n >= MAX_ATTEMPTS) {
+        await query('UPDATE otp_codes SET attempts = $2, consumed_at = NOW() WHERE id = $1', [otp.id, n]);
+        return res.status(429).json({ success: false, code: 'too_many_attempts', message: 'Trop d\'essais — demandez un nouveau code' });
+      }
+      await query('UPDATE otp_codes SET attempts = $2 WHERE id = $1', [otp.id, n]);
+      return res.status(400).json({ success: false, message: 'Code invalide ou expiré' });
+    }
+
+    // Consume atomically so two requests with the same code cannot both win.
+    const used = await query(
+      'UPDATE otp_codes SET consumed_at = NOW() WHERE id = $1 AND consumed_at IS NULL RETURNING id',
+      [otp.id]
+    );
+    if (!used.rows.length) {
+      return res.status(400).json({ success: false, message: 'Code invalide ou expiré' });
+    }
 
     const field = otp.channel === 'email' ? 'email_verified' : 'phone_verified';
     const updated = await query(
-      `UPDATE citizens SET ${field} = TRUE, updated_at = NOW() WHERE id = $1 RETURNING *`,
-      [citizen_id]
+      `UPDATE citizens SET ${field} = TRUE, updated_at = NOW()
+        WHERE id = $1 AND NOT email_verified AND NOT phone_verified RETURNING *`,
+      [otp.citizen_id]
     );
+    if (!updated.rows.length) {
+      return res.status(400).json({ success: false, code: 'already_verified', message: 'Ce compte est déjà vérifié — connectez-vous avec votre mot de passe' });
+    }
     const citizen = updated.rows[0];
 
-    // First verification is itself a civic step — start the points ledger.
-    await awardPoints(citizen.id, 5, 'Compte vérifié', 'citizen', citizen.id);
+    // First verification is itself a civic step — awarded ONCE per account.
+    const prior = await query(
+      "SELECT 1 FROM point_events WHERE citizen_id = $1 AND reason = 'Compte vérifié' LIMIT 1",
+      [citizen.id]
+    );
+    if (!prior.rows.length) {
+      await awardPoints(citizen.id, 5, 'Compte vérifié', 'citizen', citizen.id);
+    }
+    const fresh = await query('SELECT * FROM citizens WHERE id = $1', [citizen.id]);
 
     res.json({
       success: true,
       message: 'Compte vérifié',
-      token: sign(citizen),
-      data: publicCitizen(citizen)
+      token: sign(fresh.rows[0]),
+      data: publicCitizen(fresh.rows[0])
     });
   } catch (e) {
     console.error('verify-otp error', e.message);
@@ -126,15 +192,45 @@ router.post('/verify-otp', async (req, res) => {
 });
 
 // POST /api/auth/resend-otp
+// 🔒 Needs the ticket. Never for a verified account. Rate-limited per account.
 router.post('/resend-otp', async (req, res) => {
   try {
-    const { citizen_id } = req.body;
-    const { rows } = await query('SELECT * FROM citizens WHERE id = $1', [citizen_id]);
-    if (!rows.length) return res.status(404).json({ success: false, message: 'Compte introuvable' });
-    const channel = rows[0].email ? 'email' : 'sms';
-    const code = await issueOtp(rows[0].id, channel);
+    const { ticket } = req.body;
+    if (!ticket) {
+      return res.status(400).json({ success: false, code: 'ticket_required', message: 'Session de vérification expirée — reconnectez-vous pour recevoir un nouveau code' });
+    }
+    const th = hashTicket(ticket);
+    const { rows } = await query(
+      `SELECT c.* FROM otp_codes o JOIN citizens c ON c.id = o.citizen_id
+        WHERE o.ticket_hash = $1 AND o.created_at > NOW() - INTERVAL '1 hour'
+        ORDER BY o.id DESC LIMIT 1`,
+      [th]
+    );
+    if (!rows.length) {
+      return res.status(400).json({ success: false, code: 'ticket_required', message: 'Session de vérification expirée — reconnectez-vous pour recevoir un nouveau code' });
+    }
+    const citizen = rows[0];
+    if (isVerified(citizen) || citizen.status !== 'active') {
+      return res.status(400).json({ success: false, code: 'already_verified', message: 'Ce compte est déjà vérifié — connectez-vous avec votre mot de passe' });
+    }
+    const recent = await query(
+      `SELECT COUNT(*)::int AS n,
+              COALESCE(EXTRACT(EPOCH FROM (NOW() - MAX(created_at))), 99999)::int AS age
+         FROM otp_codes WHERE citizen_id = $1 AND created_at > NOW() - INTERVAL '1 hour'`,
+      [citizen.id]
+    );
+    const { n, age } = recent.rows[0];
+    if (age < RESEND_COOLDOWN_SEC) {
+      return res.status(429).json({ success: false, code: 'wait', message: 'Patientez une minute avant de redemander un code' });
+    }
+    if (n >= MAX_CODES_PER_HOUR) {
+      return res.status(429).json({ success: false, code: 'too_many_codes', message: 'Trop de codes demandés — réessayez dans une heure' });
+    }
+    const channel = citizen.email ? 'email' : 'sms';
+    const { code } = await issueOtp(citizen.id, channel, 'verify', th);
     res.json({ success: true, message: 'Nouveau code envoyé', data: { otp: EXPOSE_OTP ? code : undefined } });
   } catch (e) {
+    console.error('resend-otp error', e.message);
     res.status(500).json({ success: false, message: 'Erreur serveur' });
   }
 });
@@ -165,12 +261,12 @@ router.post('/login', async (req, res) => {
     // Unverified accounts must finish OTP before they get a session.
     if (!citizen.email_verified && !citizen.phone_verified) {
       const channel = citizen.email ? 'email' : 'sms';
-      const code = await issueOtp(citizen.id, channel);
+      const { code, ticket } = await issueOtp(citizen.id, channel);
       return res.status(403).json({
         success: false,
         code: 'verification_required',
         message: 'Compte non vérifié — un nouveau code vient d\'être envoyé',
-        data: { citizen_id: citizen.id, channel, otp: EXPOSE_OTP ? code : undefined }
+        data: { citizen_id: citizen.id, channel, ticket, otp: EXPOSE_OTP ? code : undefined }
       });
     }
 

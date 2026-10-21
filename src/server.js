@@ -67,6 +67,41 @@ app.post('/api/admin/migrate', async (req, res) => {
   }
 });
 
+/* 🔒 21 Oct 2026 — READ-ONLY security review, same SETUP_KEY guard as migrate.
+   Answers "was the OTP hole used?": admin accounts, repeated verification
+   awards, unusual code volumes. Masks contact details; changes nothing. */
+app.get('/api/admin/audit', async (req, res) => {
+  const key = req.headers['x-setup-key'];
+  if (!process.env.SETUP_KEY || key !== process.env.SETUP_KEY) {
+    return res.status(403).json({ success: false, message: 'Clé invalide' });
+  }
+  try {
+    const { query } = require('./db/pool');
+    const mask = (v) => (v ? String(v).replace(/^(.{2}).*(.{3})$/, '$1***$2') : null);
+    const totals = (await query(`SELECT COUNT(*)::int AS citizens,
+        COUNT(*) FILTER (WHERE email_verified OR phone_verified)::int AS verified,
+        COUNT(*) FILTER (WHERE role <> 'citizen')::int AS non_citizen_roles,
+        MAX(created_at) AS newest FROM citizens`)).rows[0];
+    const roles = (await query(`SELECT id, role, email, phone, status, points, created_at, updated_at
+        FROM citizens WHERE role <> 'citizen' ORDER BY id`)).rows
+      .map((r) => ({ ...r, email: mask(r.email), phone: mask(r.phone) }));
+    const repeatVerify = (await query(`SELECT citizen_id, COUNT(*)::int AS awards, SUM(points)::int AS pts,
+        MIN(created_at) AS first, MAX(created_at) AS last
+        FROM point_events WHERE reason = 'Compte vérifié'
+        GROUP BY citizen_id HAVING COUNT(*) > 1 ORDER BY awards DESC`)).rows;
+    const codeVolume = (await query(`SELECT citizen_id, COUNT(*)::int AS codes,
+        COUNT(*) FILTER (WHERE consumed_at IS NOT NULL)::int AS used,
+        MIN(created_at) AS first, MAX(created_at) AS last
+        FROM otp_codes GROUP BY citizen_id ORDER BY codes DESC LIMIT 15`)).rows;
+    const certs = (await query(`SELECT level, COUNT(*)::int AS n FROM certificates GROUP BY level`)).rows;
+    const cms = (await query(`SELECT id, email, role, status, created_at, last_login FROM cms_users ORDER BY id`)
+      .catch(() => ({ rows: [] }))).rows.map((r) => ({ ...r, email: mask(r.email) }));
+    res.json({ success: true, totals, roles, repeatVerify, codeVolume, certs, cms });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/civic', require('./routes/civic'));
 /* The StarFlex content manager. ⛔ Its own accounts, its own tokens — see the

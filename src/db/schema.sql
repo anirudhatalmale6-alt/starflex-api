@@ -39,6 +39,14 @@ CREATE TABLE IF NOT EXISTS otp_codes (
 );
 CREATE INDEX IF NOT EXISTS otp_codes_citizen_idx ON otp_codes(citizen_id, consumed_at);
 
+-- 🔒 21 Oct 2026 security fix. A code is only usable together with a secret
+-- "ticket" handed to the person who registered (or who just logged in with the
+-- right password). Before this, the sequential citizen id was enough to ask
+-- for a code and turn it into a login for ANY account.
+ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS ticket_hash TEXT;
+ALTER TABLE otp_codes ADD COLUMN IF NOT EXISTS attempts    INT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS otp_codes_ticket_idx ON otp_codes(ticket_hash);
+
 -- ── Civic education ─────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS modules (
   id           BIGSERIAL PRIMARY KEY,
