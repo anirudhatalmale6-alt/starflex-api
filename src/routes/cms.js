@@ -313,6 +313,130 @@ router.delete('/media/:id', cmsAuth, adminOnly, async (req, res) => {
   res.json({ success: true });
 });
 
+/* ═══ PEOPLE: CITIZENS · COURSES · CERTIFICATES (23 Nov 2026) ═══════════════
+   StarFlex (via Jeffery): "no window lists who registered", "nobody is told
+   when someone registers", "nothing manages the courses, who finished them,
+   who has a certificate". Jeffery approved these 4 at no charge.
+   🔒 ADMIN ROLE ONLY: these lists carry citizens' phones and emails; an
+   editor works on content and has no business seeing them. Read-only - no
+   route here edits or deletes a citizen. */
+let seenReady = null;
+function ensureSeen() {                        // additive, idempotent; no migration step needed
+  if (!seenReady) seenReady = query('ALTER TABLE cms_users ADD COLUMN IF NOT EXISTS citizens_seen_at TIMESTAMPTZ')
+    .catch(function (e) { seenReady = null; throw e; });
+  return seenReady;
+}
+const CIT_COLS = `c.id, c.full_name, c.email, c.phone, c.department, c.commune, c.points, c.status, c.created_at,
+  (c.email_verified OR c.phone_verified) AS verified,
+  (SELECT COUNT(*)::int FROM module_completions mc WHERE mc.citizen_id = c.id) AS modules_done,
+  ce.code AS cert_code, ce.level AS cert_level, ce.revoked_at AS cert_revoked`;
+function citWhere(q, params) {
+  q = String(q || '').trim().slice(0, 80);
+  if (!q) return '';
+  params.push('%' + q.replace(/[%_\\]/g, '\\$&') + '%');
+  return ` WHERE (c.full_name ILIKE $${params.length} OR c.email ILIKE $${params.length} OR c.phone ILIKE $${params.length}
+            OR c.commune ILIKE $${params.length} OR c.department ILIKE $${params.length})`;
+}
+
+/* the bell: how many signed up since THIS staff member last opened the list */
+router.get('/citizens/summary', cmsAuth, adminOnly, async (req, res) => {
+  try {
+    await ensureSeen();
+    const me = await query('SELECT citizens_seen_at FROM cms_users WHERE id = $1', [req.cms.id]);
+    const seen = me.rows[0] && me.rows[0].citizens_seen_at;
+    const { rows } = await query(`SELECT COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE email_verified OR phone_verified)::int AS verified,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours')::int AS last24h,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS last7d,
+        COUNT(*) FILTER (WHERE $1::timestamptz IS NULL OR created_at > $1::timestamptz)::int AS unseen
+      FROM citizens`, [seen || null]);
+    res.json({ success: true, seenAt: seen || null, ...rows[0] });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+router.post('/citizens/seen', cmsAuth, adminOnly, async (req, res) => {
+  try {
+    await ensureSeen();
+    await query('UPDATE cms_users SET citizens_seen_at = NOW() WHERE id = $1', [req.cms.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+router.get('/citizens', cmsAuth, adminOnly, async (req, res) => {
+  try {
+    await ensureSeen();
+    const params = []; const where = citWhere(req.query.q, params);
+    const per = 50, page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const total = (await query(`SELECT COUNT(*)::int AS n FROM citizens c${where}`, params)).rows[0].n;
+    const me = await query('SELECT citizens_seen_at FROM cms_users WHERE id = $1', [req.cms.id]);
+    const seen = me.rows[0] && me.rows[0].citizens_seen_at;
+    const { rows } = await query(`SELECT ${CIT_COLS} FROM citizens c LEFT JOIN certificates ce ON ce.citizen_id = c.id${where}
+      ORDER BY c.created_at DESC LIMIT ${per} OFFSET ${(page - 1) * per}`, params);
+    rows.forEach(function (r) { r.isNew = !seen || new Date(r.created_at) > new Date(seen); });
+    res.json({ success: true, total, page, pages: Math.max(1, Math.ceil(total / per)), citizens: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+function csvCell(v) {
+  let s = v == null ? '' : (v instanceof Date ? v.toISOString().slice(0, 16).replace('T', ' ') : String(v));
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;                     // no formula injection when opened in Excel
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+function sendCsv(res, name, head, rows) {
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + name + '"');
+  res.send('﻿' + [head.map(csvCell).join(',')].concat(rows.map(function (r) { return r.map(csvCell).join(','); })).join('\r\n'));
+}
+router.get('/citizens.csv', cmsAuth, adminOnly, async (req, res) => {
+  try {
+    const params = []; const where = citWhere(req.query.q, params);
+    const { rows } = await query(`SELECT ${CIT_COLS} FROM citizens c LEFT JOIN certificates ce ON ce.citizen_id = c.id${where}
+      ORDER BY c.created_at DESC`, params);
+    sendCsv(res, 'starflex-citoyens.csv',
+      ['Inscrit le', 'Nom', 'Téléphone', 'Email', 'Département', 'Commune', 'Vérifié', 'Modules terminés', 'Points', 'Certificat', 'Niveau', 'Statut'],
+      rows.map(function (r) { return [r.created_at, r.full_name, r.phone, r.email, r.department, r.commune, r.verified ? 'oui' : 'non',
+        r.modules_done, r.points, r.cert_code && !r.cert_revoked ? r.cert_code : '', r.cert_code && !r.cert_revoked ? r.cert_level : '', r.status]; }));
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+/* courses = the published modules; "finished the course" = finished ALL of them */
+router.get('/courses', cmsAuth, adminOnly, async (req, res) => {
+  try {
+    const mods = (await query(`SELECT m.id, m.title, m.published, m.sort_order,
+        (SELECT COUNT(*)::int FROM module_completions mc WHERE mc.module_id = m.id) AS completed
+      FROM modules m ORDER BY m.sort_order, m.id`)).rows;
+    const nPub = mods.filter(function (m) { return m.published; }).length;
+    const agg = (await query(`SELECT
+        COUNT(*)::int AS citizens,
+        COUNT(*) FILTER (WHERE n = 0)::int AS not_started,
+        COUNT(*) FILTER (WHERE n > 0 AND n < $1)::int AS in_progress,
+        COUNT(*) FILTER (WHERE $1 > 0 AND n >= $1)::int AS finished
+      FROM (SELECT c.id, (SELECT COUNT(*) FROM module_completions mc JOIN modules m ON m.id = mc.module_id
+                          WHERE mc.citizen_id = c.id AND m.published) AS n FROM citizens c) t`, [nPub])).rows[0];
+    res.json({ success: true, modules: mods, publishedModules: nPub, ...agg });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+router.get('/courses/:id/completions', cmsAuth, adminOnly, async (req, res) => {
+  try {
+    const { rows } = await query(`SELECT c.full_name, c.phone, c.email, mc.completed_at
+      FROM module_completions mc JOIN citizens c ON c.id = mc.citizen_id
+      WHERE mc.module_id = $1 ORDER BY mc.completed_at DESC LIMIT 500`, [Number(req.params.id)]);
+    res.json({ success: true, completions: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+router.get('/certificates', cmsAuth, adminOnly, async (req, res) => {
+  try {
+    const { rows } = await query(`SELECT ce.code, ce.level, ce.points_at_issue, ce.issued_at, ce.revoked_at,
+        c.full_name, c.phone, c.email, c.commune
+      FROM certificates ce JOIN citizens c ON c.id = ce.citizen_id ORDER BY ce.issued_at DESC`);
+    if (req.query.format === 'csv') {
+      return sendCsv(res, 'starflex-certificats.csv', ['Délivré le', 'Code', 'Niveau', 'Nom', 'Téléphone', 'Email', 'Commune', 'Points', 'Révoqué le'],
+        rows.map(function (r) { return [r.issued_at, r.code, r.level, r.full_name, r.phone, r.email, r.commune, r.points_at_issue, r.revoked_at]; }));
+    }
+    const byLevel = {};
+    rows.forEach(function (r) { if (!r.revoked_at) byLevel[r.level] = (byLevel[r.level] || 0) + 1; });
+    res.json({ success: true, total: rows.filter(function (r) { return !r.revoked_at; }).length, byLevel, certificates: rows });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
 /* ─── WHAT THE PUBLIC SITE READS ──────────────────────────────────────── */
 router.get('/public/content', async (req, res) => {
   try {
